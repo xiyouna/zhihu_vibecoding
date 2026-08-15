@@ -6,6 +6,9 @@ import {
   getRoom,
   joinRoom,
   removeTestBots,
+  reserveCard,
+  cancelCard,
+  requestHint,
   runBotTurn,
   startGame,
   stealTurn,
@@ -70,8 +73,18 @@ export async function POST(request: NextRequest) {
         room = await runBotTurn(roomCode, playerId);
         break;
       case "card":
-        room = playCard(roomCode, playerId, String(body.cardId ?? ""));
+        room = playCard(roomCode, playerId, String(body.cardId ?? ""), String(body.targetValue ?? ""), String(body.prompt ?? ""));
         break;
+      case "reserve_card":
+        room = reserveCard(roomCode, playerId, String(body.cardId ?? ""));
+        break;
+      case "cancel_card":
+        room = cancelCard(roomCode, playerId);
+        break;
+      case "hint": {
+        const result = await requestHint(roomCode, playerId, String(body.cardId ?? ""), String(body.question ?? ""));
+        return NextResponse.json({ ok: true, room: result.room, hint: result.hint });
+      }
       case "vote":
         room = voteToEnd(roomCode, playerId);
         break;

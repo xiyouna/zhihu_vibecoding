@@ -2,9 +2,17 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Image from "next/image";
-import { QUESTION_CARDS, STORY_CARDS, type GameMode, type Room } from "@/lib/game-types";
+import { createPortal } from "react-dom";
+import {
+  CARD_WINDOW_MS,
+  STEAL_WINDOW_MS,
+  cardsForMode,
+  type CardDefinition,
+  type GameMode,
+  type Room,
+} from "@/lib/game-types";
 
-type ApiResult = { ok: boolean; room?: Room; error?: string };
+type ApiResult = { ok: boolean; room?: Room; error?: string; hint?: string };
 
 const DEFAULT_QUESTIONS = [
   "AI 会取代程序员吗？",
@@ -49,6 +57,11 @@ export default function KanshanApp() {
   const [notice, setNotice] = useState("");
   const [now, setNow] = useState(0);
   const [questionOptions, setQuestionOptions] = useState(DEFAULT_QUESTIONS);
+  const [selectedCard, setSelectedCard] = useState<CardDefinition | null>(null);
+  const [cardTarget, setCardTarget] = useState("");
+  const [cardPrompt, setCardPrompt] = useState("");
+  const [hintQuestion, setHintQuestion] = useState("");
+  const [privateHint, setPrivateHint] = useState<{ turn: string; text: string } | null>(null);
 
   useEffect(() => {
     const hydration = setTimeout(() => {
@@ -106,7 +119,7 @@ export default function KanshanApp() {
     }
   }, [playerId]);
 
-  const currentBotId = room?.phase === "writing" ? room.turnOrder[room.turnIndex] : "";
+  const currentBotId = room?.phase === "writing" && room.turnStage === "writing" ? room.turnOrder[room.turnIndex] : "";
   const currentBot = room?.players.find((item) => item.id === currentBotId && item.isBot);
   const botTurnKey = room && currentBot && room.hostId === playerId ? `${room.code}:${room.round}:${room.turnIndex}:${currentBot.id}` : "";
   const botRoomCode = botTurnKey ? room?.code ?? "" : "";
@@ -118,6 +131,8 @@ export default function KanshanApp() {
     }, 1100);
     return () => clearTimeout(timer);
   }, [botRoomCode, botTurnKey, post]);
+
+  const activeTurnIdentity = room?.phase === "writing" ? `${room.round}:${room.turnIndex}:${room.turnOrder[room.turnIndex] ?? ""}` : "";
 
   const create = async () => {
     if (!nickname.trim()) return setNotice("先给自己取一个昵称");
@@ -143,6 +158,53 @@ export default function KanshanApp() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const playSelectedCard = async () => {
+    if (!room || !selectedCard) return;
+    if (selectedCard.timing === "hint") {
+      if (!hintQuestion.trim()) return setNotice("请写下你想得到的提示");
+      setBusy(true);
+      setNotice("");
+      try {
+        const response = await fetch("/api/rooms", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "hint", playerId, roomCode: room.code, cardId: selectedCard.id, question: hintQuestion.trim() }),
+        });
+        const result = await response.json() as ApiResult;
+        if (!result.ok || !result.room || !result.hint) throw new Error(result.error || "看山暂时没想好");
+        setRoom(result.room);
+        setPrivateHint({ turn: activeTurnIdentity, text: result.hint });
+        setSelectedCard(null);
+        setHintQuestion("");
+      } catch (error) {
+        setNotice(error instanceof Error ? error.message : "获取提示失败");
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    const payload = selectedCard.timing === "steal"
+      ? { action: "steal", roomCode: room.code }
+      : { action: "card", roomCode: room.code, cardId: selectedCard.id, targetValue: cardTarget, prompt: cardPrompt.trim() };
+    const next = await post(payload);
+    if (next) {
+      setSelectedCard(null);
+      setCardTarget("");
+      setCardPrompt("");
+    }
+  };
+
+  const closeSelectedCard = async () => {
+    if (!room || !selectedCard || busy) return;
+    if (selectedCard.timing !== "steal" && room.cardReservation?.playerId === playerId) {
+      await post({ action: "cancel_card", roomCode: room.code });
+    }
+    setSelectedCard(null);
+    setCardTarget("");
+    setCardPrompt("");
+    setHintQuestion("");
   };
 
   if (!room) {
@@ -243,9 +305,67 @@ export default function KanshanApp() {
   const current = room.players.find((item) => item.id === currentId);
   const me = room.players.find((item) => item.id === playerId);
   const isCurrent = currentId === playerId;
-  const canSteal = !isCurrent && !room.spokenThisRound.includes(playerId) && room.phase === "writing";
-  const remaining = room.turnStartedAt && now > 0 ? Math.min(room.turnDuration, Math.max(0, room.turnDuration - Math.floor((now - room.turnStartedAt) / 1000))) : room.turnDuration;
-  const cards = room.mode === "question" ? QUESTION_CARDS : STORY_CARDS;
+  const remaining = room.cardReservation?.pausedStage === "writing"
+    ? Math.ceil(room.cardReservation.remainingMs / 1000)
+    : room.turnStartedAt && now > 0
+      ? Math.min(room.turnDuration, Math.max(0, room.turnDuration - Math.floor((now - room.turnStartedAt) / 1000)))
+      : room.turnDuration;
+  const cards = cardsForMode(room.mode);
+  const usedCardThisRound = room.cardUsages.some((usage) => usage.playerId === playerId && usage.round === room.round);
+  const stageDuration = room.turnStage === "steal" ? STEAL_WINDOW_MS : room.turnStage === "card" ? CARD_WINDOW_MS : 0;
+  const stageRemaining = stageDuration && room.stageStartedAt && now > 0
+    ? Math.max(0, Math.ceil((stageDuration - (now - room.stageStartedAt)) / 1000))
+    : 0;
+  const reservationIsMine = room.cardReservation?.playerId === playerId;
+  const activeEffectForMe = room.activeEffect?.targetPlayerId === playerId;
+  const activeEffectByMe = room.activeEffect?.ownerId === playerId;
+
+  const targetOptions = (card: CardDefinition) => {
+    if (card.targetType === "entry" || card.targetType === "entry-or-question") return room.entries.map((entry) => ({ value: entry.id, label: `${entry.playerName}：${entry.text.slice(0, 48)}` }));
+    if (card.targetType === "hook") return room.storyState.hooks.map((hook) => ({ value: hook, label: hook }));
+    if (card.targetType === "perspective") return [
+      { value: "first", label: "第一人称（我）" },
+      { value: "third", label: "限知第三人称（仅写角色所知）" },
+    ];
+    return [];
+  };
+
+  const cardDisabledReason = (card: CardDefinition) => {
+    if (busy) return "正在处理上一个操作";
+    if (usedCardThisRound) return "你这一轮已经用过技能卡";
+    if ((me?.availableScore ?? 0) < card.cost) return `还需要 ${card.cost - (me?.availableScore ?? 0)} 言值`;
+    if (room.cardReservation) return room.cardReservation.playerId === playerId ? "你正在设置另一张卡" : `${room.cardReservation.playerName} 正在设置「${room.cardReservation.cardName}」`;
+    if (card.timing === "steal") {
+      if (room.turnStage !== "steal") return "只能在 5 秒抢笔窗口使用";
+      if (isCurrent) return "笔已经在你手里";
+      if (room.spokenThisRound.includes(playerId)) return "你这一轮已经落过笔";
+      return "";
+    }
+    if (card.timing === "hint") {
+      if (!isCurrent || room.turnStage !== "writing") return "只能由正在写作的执笔者使用";
+      return "";
+    }
+    if (room.turnStage !== "card") return "只能在 6 秒约束卡窗口使用";
+    if (room.activeEffect) return "这一笔已经有一个约束";
+    if (card.selfOnly && !isCurrent) return "这张卡只能对自己使用";
+    if (card.targetType === "entry" && targetOptions(card).length === 0) return "还没有可选的发言";
+    if (card.targetType === "hook" && targetOptions(card).length === 0) return "还没有未解决伏笔";
+    return "";
+  };
+
+  const openCard = async (card: CardDefinition) => {
+    const reason = cardDisabledReason(card);
+    if (reason) return setNotice(reason);
+    const options = targetOptions(card);
+    setCardTarget(options[0]?.value ?? "");
+    setCardPrompt(card.id === "perspective" ? room.storyState.characters[0] ?? "" : "");
+    setHintQuestion("");
+    if (card.timing !== "steal") {
+      const reserved = await post({ action: "reserve_card", roomCode: room.code, cardId: card.id });
+      if (!reserved) return;
+    }
+    setSelectedCard(card);
+  };
 
   return (
     <main className={`table-shell mode-${room.mode}`}>
@@ -266,7 +386,10 @@ export default function KanshanApp() {
               </div>
             ))}
           </div>
-          {canSteal && <button className="steal-button" disabled={busy} onClick={() => post({ action: "steal", roomCode: room.code })}>✎ 抢笔</button>}
+          <div className={`turn-stage stage-${room.turnStage}`}>
+            <small>{room.cardReservation ? `${room.cardReservation.playerName} 正在设置卡牌` : room.turnStage === "steal" ? "抢笔窗口" : room.turnStage === "card" ? "效果卡窗口" : "正在执笔"}</small>
+            <strong>{room.cardReservation ? "已暂停" : room.turnStage === "writing" ? `${remaining} 秒` : `${stageRemaining} 秒`}</strong>
+          </div>
           <div className="room-mini"><span>房间 {room.code}</span><button onClick={() => navigator.clipboard?.writeText(`${location.origin}?room=${room.code}`)}>复制邀请</button></div>
         </aside>
 
@@ -279,6 +402,9 @@ export default function KanshanApp() {
                 <div className="entry-byline"><span>{String(index + 1).padStart(2, "0")}</span><strong>{entry.playerName}</strong><i /></div>
                 <p>{entry.text}</p>
                 <div className="entry-score"><strong>+{entry.score} 言值</strong><span>{entry.reason}</span></div>
+                {entry.effectResolution && <div className={`effect-result ${entry.effectResolution.completed === true ? "passed" : entry.effectResolution.completed === false ? "failed" : "unknown"}`}>
+                  {entry.effectResolution.completed === true ? "✓" : entry.effectResolution.completed === false ? "×" : "·"} {entry.effectResolution.cardName}：{entry.effectResolution.reason}
+                </div>}
               </article>
             ))}
             {room.phase === "scoring" && <div className="judging"><i /><span>刘看山正在批注这一笔……</span></div>}
@@ -293,14 +419,28 @@ export default function KanshanApp() {
             {room.mode === "question" ? (
               <ul>{room.coveredPoints.slice(-4).map((point, index) => <li key={`${point}-${index}`}>{point}</li>)}{room.coveredPoints.length === 0 && <li className="muted">还没有被打开的观点</li>}</ul>
             ) : (
-              <ul>{room.openHooks.slice(-4).map((hook, index) => <li key={`${hook}-${index}`}>{hook}</li>)}{room.openHooks.length === 0 && <li className="muted">伏笔会在这里留下记号</li>}</ul>
+              <>
+                {room.storyState.characters.length > 0 && <><b className="notebook-label">角色</b><ul>{room.storyState.characters.slice(-4).map((character) => <li key={character}>{character}</li>)}</ul></>}
+                <b className="notebook-label">未解决伏笔</b>
+                <ul>{room.storyState.hooks.slice(-4).map((hook, index) => <li key={`${hook}-${index}`}>{hook}</li>)}{room.storyState.hooks.length === 0 && <li className="muted">伏笔会在这里留下记号</li>}</ul>
+              </>
             )}
           </section>
+          {room.cardReservation && <section className={`card-setup-status ${reservationIsMine ? "mine" : ""}`}>
+            <strong>{reservationIsMine ? `你正在设置「${room.cardReservation.cardName}」` : `${room.cardReservation.playerName} 正在设置「${room.cardReservation.cardName}」`}</strong>
+            <p>效果卡倒计时已暂停，确认或取消后继续。</p>
+          </section>}
+          {room.activeEffect && <section className={`effect-status ${activeEffectForMe ? "target" : activeEffectByMe ? "owner" : "observer"}`}>
+            <small>{activeEffectForMe && activeEffectByMe ? "你对自己使用了" : activeEffectForMe ? `${room.activeEffect.ownerName} 对你使用了` : activeEffectByMe ? `你已对 ${room.activeEffect.targetPlayerName} 使用` : `${room.activeEffect.ownerName} → ${room.activeEffect.targetPlayerName}`}</small>
+            <strong>{room.activeEffect.cardName}</strong>
+            <p>{room.activeEffect.instruction}</p>
+            {activeEffectForMe && <b>必须按要求完成这一笔，否则本次最高只能获得 5 言值。</b>}
+          </section>}
           <section className="cards-panel">
-            <div className="panel-heading"><span>手边的卡</span><small>每次一张</small></div>
+            <div className="panel-heading"><span>手边的卡</span><small>{usedCardThisRound ? "本轮已用" : "每轮一张"}</small></div>
             <div className="card-grid">
               {cards.map((card) => (
-                <button key={card.id} title={card.description} disabled={busy || Boolean(room.activeEffect) || (me?.availableScore ?? 0) < card.cost} onClick={() => post({ action: "card", roomCode: room.code, cardId: card.id })}>
+                <button key={card.id} title={cardDisabledReason(card) || card.description} disabled={Boolean(cardDisabledReason(card))} onClick={() => openCard(card)}>
                   <span>{card.symbol}</span><strong>{card.name}</strong><small>言 {card.cost}</small>
                 </button>
               ))}
@@ -309,17 +449,75 @@ export default function KanshanApp() {
         </aside>
       </div>
 
-      <section className={`writing-dock ${isCurrent ? "active" : ""}`}>
+      <section className={`writing-dock ${isCurrent ? "active" : ""} ${isCurrent && room.activeEffect ? "has-effect" : ""}`}>
         <div className="writer-state"><span className="avatar" style={{ background: current?.color }}>{current?.nickname.slice(0, 1)}</span><div><small>当前执笔</small><strong>{current?.nickname}</strong></div></div>
-        {isCurrent ? (
-          <div className="writing-area">
-            {room.activeEffect && <div className="active-effect">{room.activeEffect.cardName}：{room.activeEffect.instruction}</div>}
-            <textarea value={draft} onChange={(event) => setDraft([...event.target.value].slice(0, 140).join(""))} placeholder={room.mode === "question" ? "写下你的观点……" : "接着写下去……"} disabled={busy || room.phase !== "writing"} />
-            <div className="writing-meta"><span className={remaining < 20 ? "urgent" : ""}>{Math.floor(remaining / 60).toString().padStart(2, "0")}:{(remaining % 60).toString().padStart(2, "0")}</span><small>{[...draft].length}/140</small><button disabled={!draft.trim() || busy} onClick={async () => { const next = await post({ action: "submit", roomCode: room.code, text: draft }); if (next) setDraft(""); }}>落笔 <b>↗</b></button></div>
+        {isCurrent && room.turnStage === "writing" ? (
+          <div className={`writing-area ${room.activeEffect ? "has-effect" : ""}`}>
+            {room.activeEffect && <section className="active-effect" aria-label="本次强制续写要求">
+              <div><span>{room.activeEffect.ownerName} 对你使用了</span><strong>{room.activeEffect.cardName}</strong></div>
+              <p>{room.activeEffect.instruction}</p>
+              <b>请按卡面要求续写；未完成将被判定违反效果，本次最高 5 言值。</b>
+            </section>}
+            {privateHint?.turn === activeTurnIdentity && <div className="private-hint"><button onClick={() => setPrivateHint(null)} aria-label="关闭提示">×</button><strong>看山的提示 · 仅你可见</strong><p>{privateHint.text}</p></div>}
+            <textarea value={draft} onChange={(event) => setDraft([...event.target.value].slice(0, 140).join(""))} placeholder={room.mode === "question" ? "写下你的观点……" : "接着写下去……"} disabled={busy || Boolean(room.cardReservation)} />
+            <div className="writing-meta"><span className={remaining < 20 ? "urgent" : ""}>{room.cardReservation ? "暂停" : `${Math.floor(remaining / 60).toString().padStart(2, "0")}:${(remaining % 60).toString().padStart(2, "0")}`}</span><small>{[...draft].length}/140</small><button disabled={!draft.trim() || busy || Boolean(room.cardReservation)} onClick={async () => { const next = await post({ action: "submit", roomCode: room.code, text: draft }); if (next) setDraft(""); }}>落笔 <b>↗</b></button></div>
           </div>
-        ) : <div className="waiting-copy"><span>笔正在 {current?.nickname} 手里</span><small>{current?.isBot ? "测试 AI 正在读前文并构思这一笔。" : "读一读前文，想想你的下一笔。"}</small></div>}
+        ) : <div className="waiting-copy"><span>{room.cardReservation ? `${room.cardReservation.playerName} 正在设置「${room.cardReservation.cardName}」` : room.turnStage === "steal" ? `笔暂时在 ${current?.nickname} 手里` : room.turnStage === "card" ? `正在为 ${current?.nickname} 拍卡` : `笔正在 ${current?.nickname} 手里`}</span><small>{room.cardReservation ? "牌桌倒计时已暂停，等待卡牌确认。" : room.turnStage === "steal" ? `还有 ${stageRemaining} 秒可以使用「抢笔」。` : room.turnStage === "card" ? `还有 ${stageRemaining} 秒可以拍下一张效果卡。` : current?.isBot ? "测试 AI 正在读前文并构思这一笔。" : "读一读前文，想想你的下一笔。"}</small></div>}
         <button className="end-vote" disabled={room.round < 2 || room.endVotes.includes(playerId)} onClick={() => post({ action: "vote", roomCode: room.code })}>收笔投票 {room.endVotes.length}/{Math.floor(room.players.length / 2) + 1}</button>
       </section>
+      {selectedCard && createPortal(<div className={`card-dialog-backdrop mode-${room.mode}`} role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) void closeSelectedCard(); }}>
+        <section className="card-dialog" role="dialog" aria-modal="true" aria-labelledby="card-dialog-title">
+          <button className="dialog-close" onClick={() => void closeSelectedCard()} disabled={busy} aria-label="关闭并继续倒计时">×</button>
+          <span className="dialog-symbol">{selectedCard.symbol}</span>
+          <p>{selectedCard.timing === "steal" ? "通用技能" : room.mode === "question" ? "问答批注" : "故事灵感"}</p>
+          <h2 id="card-dialog-title">{selectedCard.name}</h2>
+          <div className="dialog-description">{selectedCard.description}</div>
+          <div className="dialog-timing"><span>使用时间</span><strong>{selectedCard.timing === "steal" ? "5 秒抢笔窗口" : selectedCard.timing === "hint" ? "你自己的正式写作阶段" : "执笔前的效果卡阶段"}</strong></div>
+          {selectedCard.timing === "hint" && <label className="dialog-field">
+            <span>你想问看山什么？</span>
+            <textarea value={hintQuestion} onChange={(event) => setHintQuestion([...event.target.value].slice(0, 80).join(""))} maxLength={80} placeholder={room.mode === "story" ? "例如：怎样让这个伏笔自然回到主线？" : "例如：还有哪个角度没有被讨论？"} />
+            <small>{[...hintQuestion].length}/80</small>
+          </label>}
+          {selectedCard.targetType === "entry-or-question" && <>
+            <label className="dialog-field">
+              <span>引用一段已有文字（可选）</span>
+              <select value={cardTarget} onChange={(event) => setCardTarget(event.target.value)}>
+                <option value="">不引用，直接提出问题</option>
+                {targetOptions(selectedCard).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </label>
+            <label className="dialog-field">
+              <span>要求对方回答的问题</span>
+              <textarea value={cardPrompt} onChange={(event) => setCardPrompt([...event.target.value].slice(0, 80).join(""))} maxLength={80} placeholder="例如：如果 AI 能理解业务上下文，程序员不可替代的部分还剩什么？" />
+              <small>{[...cardPrompt].length}/80 · 对方必须直接回答这个问题</small>
+            </label>
+          </>}
+          {selectedCard.targetType === "perspective" && <>
+            <label className="dialog-field">
+              <span>这一笔跟随哪个角色？</span>
+              <input value={cardPrompt} onChange={(event) => setCardPrompt([...event.target.value].slice(0, 24).join(""))} maxLength={24} list="story-characters" placeholder="输入角色名，例如：李薇" />
+              <datalist id="story-characters">{room.storyState.characters.map((character) => <option key={character} value={character} />)}</datalist>
+            </label>
+            <label className="dialog-field">
+              <span>叙事视角</span>
+              <select value={cardTarget} onChange={(event) => setCardTarget(event.target.value)}>
+                {targetOptions(selectedCard).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </select>
+            </label>
+          </>}
+          {(selectedCard.targetType === "entry" || selectedCard.targetType === "hook") && <label className="dialog-field">
+            <span>{selectedCard.targetType === "entry" ? "选择一段已有发言" : "选择一个未解决伏笔"}</span>
+            <select value={cardTarget} onChange={(event) => setCardTarget(event.target.value)}>
+              {targetOptions(selectedCard).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+          </label>}
+          {selectedCard.timing !== "steal" && <div className="dialog-pause">Ⅱ 牌桌倒计时已暂停，最多保留 2 分钟</div>}
+          <div className="dialog-target"><span>作用对象</span><strong>{selectedCard.timing === "hint" ? "你自己，结果仅你可见" : selectedCard.timing === "steal" ? `与 ${current?.nickname} 交换顺序` : `${current?.nickname} 的这一笔`}</strong></div>
+          <button className="dialog-confirm" onClick={playSelectedCard} disabled={busy || (selectedCard.timing === "hint" && hintQuestion.trim().length < 2) || (selectedCard.targetType === "entry-or-question" && cardPrompt.trim().length < 2) || (selectedCard.targetType === "perspective" && (!cardPrompt.trim() || !cardTarget)) || ((selectedCard.targetType === "entry" || selectedCard.targetType === "hook") && !cardTarget)}>
+            {busy ? "看山正在处理……" : selectedCard.timing === "hint" ? `请看山提示 · 言 ${selectedCard.cost}` : `拍到桌上 · 言 ${selectedCard.cost}`}
+          </button>
+        </section>
+      </div>, document.body)}
       {notice && <div className="toast">{notice}</div>}
     </main>
   );
